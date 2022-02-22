@@ -14,6 +14,10 @@ from websockets.exceptions import ConnectionClosedError
 log = logging.getLogger(__name__)
 
 
+class StreamIntegrityError(Exception):
+    pass
+
+
 class Offer(NamedTuple):
 
     price: Decimal
@@ -127,17 +131,25 @@ async def watch(symbol):
 
         prev_last_update = None
         async for ev in watch_ws(websocket):
-            # The first processed event should have U <= lastUpdateId+1 AND u >= lastUpdateId+1.
             # Drop any event where last_update is <= lastUpdateId in the snapshot.
             if ev.last_update <= order_book_update_id:
                 log.info("Ignoring pre-snapshot event: last_update=%r", ev.last_update)
                 continue
 
-            # While listening to the stream, each new event's U should be equal to the previous
-            # event's u+1.
-            if prev_last_update is not None and ev.first_update != prev_last_update + 1:
-                raise Exception(
-                    f"Update continuity error: {ev.first_update=} != {prev_last_update=}")
+            if prev_last_update is None:
+                # The first processed event should have first_update <= order_book_update_id+1
+                # AND last_update >= order_book_update_id+1.
+                if not (ev.first_update <= order_book_update_id + 1 and
+                        ev.last_update >= order_book_update_id + 1):
+                    raise StreamIntegrityError(
+                        f"Bad continuity starting stream: {ev.first_update=} {ev.last_update=} "
+                        "{order_book_update_id=}")
+            else:
+                # While listening to the stream, each new event's first_update should be equal to the previous
+                # event's last_update.
+                if ev.first_update != prev_last_update + 1:
+                    raise StreamIntegrityError(
+                        f"Update continuity error: {ev.first_update=} != {prev_last_update=}")
 
             yield OrderBookUpdate(bids=ev.bids, asks=ev.asks)
             prev_last_update = ev.last_update
