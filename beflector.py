@@ -2,11 +2,14 @@ import logging
 import asyncio
 import signal
 import json
+import socket
 from decimal import Decimal
 from typing import Sequence, NamedTuple, List, Iterator
 import aiohttp
 from sortedcontainers import SortedDict
 from websockets import connect
+from websockets.exceptions import ConnectionClosedError
+
 
 log = logging.getLogger(__name__)
 
@@ -92,7 +95,7 @@ class DepthUpdateEvent():
 async def fetch_order_book(symbol):
     http_uri = f'https://api.binance.com/api/v3/depth?symbol={symbol}&limit=100'
     log.info("Getting order book: %r", http_uri)
-    async with aiohttp.ClientSession() as http_session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as http_session:
         async with http_session.get(http_uri) as http_response:
             return await http_response.json()
 
@@ -112,7 +115,7 @@ async def watch_ws(websocket) -> Iterator[DepthUpdateEvent]:
 async def watch(symbol):
     ws_uri = f'wss://stream.binance.com:9443/ws/{symbol.lower()}@depth'
     log.info("Listening to: %r", ws_uri)
-    async with connect(ws_uri) as websocket:
+    async with connect(ws_uri, ping_interval=1, ping_timeout=1, close_timeout=1) as websocket:
         # Using build-in websocket message buffering to keep messages while we query for the order
         # book snapshot.
 
@@ -141,12 +144,20 @@ async def watch(symbol):
 
 
 async def watch_and_print():
-    book = OrderBook()
-    async for update in watch('BNBUSDT'):
-        book.update(bids=update.bids, asks=update.asks)
+    while True:
+        try:
+            book = OrderBook()
+            async for update in watch('BNBUSDT'):
+                book.update(bids=update.bids, asks=update.asks)
 
-        print(f"Top bid price {book.top_bid.price}, quantity {book.top_bid.quantity}")
-        print(f"Top ask price {book.top_ask.price}, quantity {book.top_ask.quantity}")
+                print(f"Top bid price {book.top_bid.price}, quantity {book.top_bid.quantity}")
+                print(f"Top ask price {book.top_ask.price}, quantity {book.top_ask.quantity}")
+        except (ConnectionClosedError, socket.error, asyncio.TimeoutError):
+            # Start from scratch - this will re-request the order book snapshot, since the stream
+            # has been lost.
+            log.exception('Connection lost - retrying')
+            await asyncio.sleep(5)
+
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
