@@ -3,7 +3,7 @@ import asyncio
 import signal
 import json
 from decimal import Decimal
-from typing import Sequence, NamedTuple
+from typing import Sequence, NamedTuple, List, Iterator
 import aiohttp
 from sortedcontainers import SortedDict
 from websockets import connect
@@ -67,12 +67,46 @@ class OrderBook():
         return Offer(*self._asks.peekitem(index=0))
 
 
+class DepthUpdateEvent():
+
+    def __init__(self, event):
+        self._event = event
+
+    @property
+    def first_update(self) -> int:
+        return self._event['U']
+
+    @property
+    def last_update(self) -> int:
+        return self._event['u']
+
+    @property
+    def bids(self) -> List[str]:
+        return self._event['b']
+
+    @property
+    def asks(self) -> List[str]:
+        return self._event['a']
+
+
 async def fetch_order_book(symbol):
-    http_uri = f'https://api.binance.com/api/v3/depth?symbol={symbol}&limit=1000'
+    http_uri = f'https://api.binance.com/api/v3/depth?symbol={symbol}&limit=100'
     log.info("Getting order book: %r", http_uri)
     async with aiohttp.ClientSession() as http_session:
         async with http_session.get(http_uri) as http_response:
             return await http_response.json()
+
+
+async def watch_ws(websocket) -> Iterator[DepthUpdateEvent]:
+    while True:
+        recv = await websocket.recv()
+        msg = json.loads(recv)
+
+        msg_type = msg.get('e')
+        if msg_type == "depthUpdate":
+            yield DepthUpdateEvent(msg)
+        else:
+            log.debug('Message is not depthUpdate. Skipping message, type: %s', msg_type)
 
 
 async def watch(symbol):
@@ -89,30 +123,21 @@ async def watch(symbol):
         log.info("Got order book (update id %r)", order_book_update_id)
 
         prev_last_update = None
-        while True:
-            recv = await websocket.recv()
-            msg = json.loads(recv)
-
-            msg_type = msg.get('e')
-            if msg_type != "depthUpdate":
-                log.debug('Message is not depthUpdate. Skipping message, type: %s', msg_type)
-
-            first_update = msg['U']
-            last_update = msg['u']
-
+        async for ev in watch_ws(websocket):
             # The first processed event should have U <= lastUpdateId+1 AND u >= lastUpdateId+1.
             # Drop any event where last_update is <= lastUpdateId in the snapshot.
-            if last_update <= order_book_update_id:
-                log.info("Ignoring pre-snapshot event: last_update=%r", last_update)
+            if ev.last_update <= order_book_update_id:
+                log.info("Ignoring pre-snapshot event: last_update=%r", ev.last_update)
+                continue
 
             # While listening to the stream, each new event's U should be equal to the previous
             # event's u+1.
-            if prev_last_update is not None and first_update != prev_last_update + 1:
+            if prev_last_update is not None and ev.first_update != prev_last_update + 1:
                 raise Exception(
-                    f"Update continuity error: {first_update=} != {prev_last_update=}")
+                    f"Update continuity error: {ev.first_update=} != {prev_last_update=}")
 
-            yield OrderBookUpdate(bids=msg['b'], asks=msg['a'])
-            prev_last_update = last_update
+            yield OrderBookUpdate(bids=ev.bids, asks=ev.asks)
+            prev_last_update = ev.last_update
 
 
 async def watch_and_print():
