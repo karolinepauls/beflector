@@ -3,8 +3,9 @@ import asyncio
 import signal
 import json
 from decimal import Decimal
-from typing import NamedTuple
+from typing import Sequence, NamedTuple
 import aiohttp
+from sortedcontainers import SortedDict
 from websockets import connect
 
 log = logging.getLogger(__name__)
@@ -34,6 +35,36 @@ class OrderBookUpdate():
     @property
     def bids(self):
         return self._decode(self._bids)
+
+
+class OrderBook():
+
+    def __init__(self):
+        self._bids = SortedDict()
+        self._asks = SortedDict()
+
+    @staticmethod
+    def _update(offers_dict, updates: Sequence[Offer]):
+        for update in updates:
+            if update.quantity == 0:
+                try:
+                    del offers_dict[update.price]
+                except KeyError:
+                    pass
+            else:
+                offers_dict[update.price] = update.quantity
+
+    def update(self, bids: Sequence[Offer], asks: Sequence[Offer]):
+        self._update(self._bids, bids)
+        self._update(self._asks, asks)
+
+    @property
+    def top_bid(self):
+        return Offer(*self._bids.peekitem(index=-1))
+
+    @property
+    def top_ask(self):
+        return Offer(*self._asks.peekitem(index=0))
 
 
 async def fetch_order_book(symbol):
@@ -85,9 +116,12 @@ async def watch(symbol):
 
 
 async def watch_and_print():
-    async for i in watch('BNBBTC'):
-        print("Asks", list(i.asks))
-        print("Bids", list(i.bids))
+    book = OrderBook()
+    async for update in watch('BNBUSDT'):
+        book.update(bids=update.bids, asks=update.asks)
+
+        print(f"Top bid price {book.top_bid.price}, quantity {book.top_bid.quantity}")
+        print(f"Top ask price {book.top_ask.price}, quantity {book.top_ask.quantity}")
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
